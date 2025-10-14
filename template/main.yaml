@@ -1,0 +1,183 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Serverless Task API (Lambda + API Gateway) provisioned with CloudFormation.
+  Provides REST endpoints backed by a Lambda function with DynamoDB persistence.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9-]+"
+    Description: Deployment environment name used for resource naming (e.g. dev, staging, prod).
+  LambdaPackageS3Bucket:
+    Type: String
+    Description: S3 bucket containing the Lambda deployment package zip.
+  LambdaPackageS3Key:
+    Type: String
+    Description: S3 key of the Lambda deployment package zip.
+  TaskTableName:
+    Type: String
+    Default: TaskService
+    Description: Base name for the DynamoDB table; environment suffix appended automatically.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Deployment Configuration
+        Parameters:
+          - EnvironmentName
+          - TaskTableName
+      - Label:
+          default: Lambda Package
+        Parameters:
+          - LambdaPackageS3Bucket
+          - LambdaPackageS3Key
+    ParameterLabels:
+      EnvironmentName:
+        default: Environment Name
+      TaskTableName:
+        default: Task Table Base Name
+      LambdaPackageS3Bucket:
+        default: Lambda Package Bucket
+      LambdaPackageS3Key:
+        default: Lambda Package Object Key
+
+Resources:
+  TaskTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TaskTableName}-${EnvironmentName}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: taskId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: taskId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+  TaskServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "TaskServiceRole-${EnvironmentName}-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TaskTableAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                Resource: !GetAtt TaskTable.Arn
+
+  TaskServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "task-service-${EnvironmentName}"
+      Runtime: python3.11
+      Handler: app.handler
+      Role: !GetAtt TaskServiceRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaPackageS3Bucket
+        S3Key: !Ref LambdaPackageS3Key
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: task-service
+          POWERTOOLS_METRICS_NAMESPACE: TaskService
+          ENVIRONMENT: !Ref EnvironmentName
+          TASKS_TABLE_NAME: !Ref TaskTable
+      TracingConfig:
+        Mode: Active
+
+  TaskApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "task-api-${EnvironmentName}"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      MinimumCompressionSize: 1024
+
+  TaskApiResourceTasks:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt TaskApi.RootResourceId
+      PathPart: tasks
+      RestApiId: !Ref TaskApi
+
+  TaskApiMethodGetTasks:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: GET
+      ResourceId: !Ref TaskApiResourceTasks
+      RestApiId: !Ref TaskApi
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub
+          - arn:aws:apigateway:${Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - Region: !Ref AWS::Region
+            LambdaArn: !GetAtt TaskServiceFunction.Arn
+      MethodResponses:
+        - StatusCode: 200
+
+  TaskApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - TaskApiMethodGetTasks
+    Properties:
+      RestApiId: !Ref TaskApi
+      Description: Initial deployment for Task API
+
+  TaskApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref TaskApi
+      DeploymentId: !Ref TaskApiDeployment
+      StageName: !Ref EnvironmentName
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          LoggingLevel: INFO
+          DataTraceEnabled: false
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 25
+
+  TaskApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt TaskServiceFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TaskApi}/*/*"
+
+Outputs:
+  ApiEndpoint:
+    Description: Invoke URL for the API Gateway stage.
+    Value: !Sub "https://${TaskApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}"
+  LambdaFunctionName:
+    Description: Name of the Lambda function.
+    Value: !Ref TaskServiceFunction
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table.
+    Value: !Ref TaskTable
