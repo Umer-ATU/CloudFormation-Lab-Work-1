@@ -1,10 +1,10 @@
 # CloudFormation Lab – Lambda and RESTful API
 
-**Student Name:** Jane Doe  
-**Student ID:** 12345678  
-**Module:** Cloud DevOps Automation  
+**Student Name:** Umer Karachiwala  
+**Student ID:** L00196895@atu.ie  
+**Module:** DevOps -- Cloudformation Lab 
 **Instructor:** Ruth Lennon  
-**Date:** 2024-04-07  
+**Date:** 15-10-2025  
 
 ---
 
