@@ -1,0 +1,446 @@
+# ------------------------------------------------------------------------------
+# CloudFormation template to provision a serverless REST API backed by DynamoDB
+# and implemented with Python Lambda functions. This template embraces
+# Infrastructure as Code best practices, ensuring consistent, repeatable
+# deployments across environments such as dev and prod.
+# ------------------------------------------------------------------------------
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AWS CloudFormation stack that provisions an Items REST API using API Gateway,
+  Lambda (Python 3.11 with Powertools), and DynamoDB. Includes request
+  validation, logging, metrics, and optional API key enforcement.
+
+# ------------------------------------------------------------------------------
+# Parameters enable controlled customization without editing the template body.
+# ------------------------------------------------------------------------------
+Parameters:
+  StageName:
+    Type: String
+    Default: dev
+    AllowedPattern: "^[a-z0-9-]+$"
+    Description: Logical stage name deployed to API Gateway (e.g., dev, prod).
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 10240
+    Description: Memory (MB) allocated to each Lambda function.
+
+  LambdaTimeout:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 29
+    Description: Timeout (seconds) for Lambda invocations.
+
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: S3 bucket containing zipped Lambda deployment packages.
+
+  CreateItemLambdaS3Key:
+    Type: String
+    Description: |
+      Object key within the LambdaCodeS3Bucket for the create_item function
+      artifact (e.g., artifacts/create_item.zip).
+
+  GetItemLambdaS3Key:
+    Type: String
+    Description: |
+      Object key within the LambdaCodeS3Bucket for the get_item function
+      artifact (e.g., artifacts/get_item.zip).
+
+  PowertoolsLayerArn:
+    Type: String
+    Default: arn:aws:lambda:us-east-1:017000801446:layer:AWSLambdaPowertoolsPythonV2:72
+    Description: ARN of the AWS Lambda Powertools for Python layer for your region.
+
+  EnableApiKey:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Toggle to provision API Key and Usage Plan for extra credit.
+
+# ------------------------------------------------------------------------------
+# Conditions define optional resources (API key and usage plan).
+# ------------------------------------------------------------------------------
+Conditions:
+  CreateApiKey: !Equals [!Ref EnableApiKey, "true"]
+
+# ------------------------------------------------------------------------------
+# Mappings hold reusable configuration snippets consumed elsewhere.
+# ------------------------------------------------------------------------------
+Mappings:
+  ResponseHeaders:
+    Default:
+      AccessControlAllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+      AccessControlAllowMethods: "'OPTIONS,GET,POST'"
+      AccessControlAllowOrigin: "'*'"
+
+# ------------------------------------------------------------------------------
+# Resources provision infrastructure components in the desired dependency order.
+# ------------------------------------------------------------------------------
+Resources:
+  # DynamoDB table storing REST resource state with on-demand capacity for
+  # automatic scaling.
+  ItemsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ItemsTable
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+
+  # IAM role granting Lambda least-privilege access to dynamodb:PutItem,
+  # dynamodb:GetItem, and CloudWatch logging actions.
+  ItemsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ItemsLambdaRole-${StageName}-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ItemsTableAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:DescribeTable
+                Resource: !GetAtt ItemsTable.Arn
+
+  # Lambda function handling POST /items requests by validating payloads and
+  # persisting items to DynamoDB.
+  CreateItemFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub create-item-${StageName}-${AWS::StackName}
+      Description: Create new items via POST /items API endpoint.
+      Runtime: python3.11
+      Handler: create_item.lambda_handler
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt ItemsLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref CreateItemLambdaS3Key
+      Layers:
+        - !Ref PowertoolsLayerArn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ItemsTable
+          POWERTOOLS_SERVICE_NAME: ItemsApi
+          POWERTOOLS_METRICS_NAMESPACE: ItemsApi
+          STAGE: !Ref StageName
+
+  # Lambda function responding to GET /items/{id} requests by fetching items
+  # from DynamoDB using the provided identifier.
+  GetItemFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub get-item-${StageName}-${AWS::StackName}
+      Description: Retrieve items via GET /items/{id} API endpoint.
+      Runtime: python3.11
+      Handler: get_item.lambda_handler
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt ItemsLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref GetItemLambdaS3Key
+      Layers:
+        - !Ref PowertoolsLayerArn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ItemsTable
+          POWERTOOLS_SERVICE_NAME: ItemsApi
+          POWERTOOLS_METRICS_NAMESPACE: ItemsApi
+          STAGE: !Ref StageName
+
+  # API Gateway REST API construct serving as the public HTTP surface.
+  ItemsRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ItemsApi-${StageName}
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Description: REST API for managing items with Lambda-backed integrations.
+
+  # /items resource path segment.
+  ItemsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ItemsRestApi
+      ParentId: !GetAtt ItemsRestApi.RootResourceId
+      PathPart: items
+
+  # /items/{id} child resource representing an item lookup by identifier.
+  ItemByIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ItemsRestApi
+      ParentId: !Ref ItemsResource
+      PathPart: "{id}"
+
+  # JSON schema validating POST request payloads before invoking Lambda.
+  CreateItemModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref ItemsRestApi
+      ContentType: application/json
+      Description: Request body model for POST /items.
+      Name: ItemsCreateModel
+      Schema:
+        type: object
+        required:
+          - name
+        properties:
+          id:
+            type: string
+            pattern: "^[A-Za-z0-9-_]+$"
+          name:
+            type: string
+            minLength: 1
+          description:
+            type: string
+            maxLength: 1024
+        additionalProperties: false
+
+  # Validator ensures request body and parameters align with defined models.
+  ItemsRequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref ItemsRestApi
+      Name: Validate body and params
+      ValidateRequestBody: true
+      ValidateRequestParameters: true
+
+  # OPTIONS /items method enabling CORS pre-flight responses.
+  ItemsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ItemsRestApi
+      ResourceId: !Ref ItemsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: !FindInMap [ResponseHeaders, Default, AccessControlAllowHeaders]
+              method.response.header.Access-Control-Allow-Methods: !FindInMap [ResponseHeaders, Default, AccessControlAllowMethods]
+              method.response.header.Access-Control-Allow-Origin: !FindInMap [ResponseHeaders, Default, AccessControlAllowOrigin]
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # OPTIONS /items/{id} method enabling CORS pre-flight for resource with path
+  # parameter.
+  ItemByIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ItemsRestApi
+      ResourceId: !Ref ItemByIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: !FindInMap [ResponseHeaders, Default, AccessControlAllowHeaders]
+              method.response.header.Access-Control-Allow-Methods: !FindInMap [ResponseHeaders, Default, AccessControlAllowMethods]
+              method.response.header.Access-Control-Allow-Origin: !FindInMap [ResponseHeaders, Default, AccessControlAllowOrigin]
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # POST /items method integrating with CreateItemFunction via Lambda proxy.
+  PostItemsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ItemsRestApi
+      ResourceId: !Ref ItemsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: !If [CreateApiKey, true, false]
+      RequestValidatorId: !Ref ItemsRequestValidator
+      RequestModels:
+        application/json: !Ref CreateItemModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateItemFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 400
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # GET /items/{id} method integrating with GetItemFunction via Lambda proxy.
+  GetItemByIdMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ItemsRestApi
+      ResourceId: !Ref ItemByIdResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: !If [CreateApiKey, true, false]
+      RequestValidatorId: !Ref ItemsRequestValidator
+      RequestParameters:
+        method.request.path.id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetItemFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 404
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Lambda permission statements allowing API Gateway invocations.
+  AllowApiInvokeCreateItem:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreateItemFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ItemsRestApi}/*/POST/items
+
+  AllowApiInvokeGetItem:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetItemFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ItemsRestApi}/*/GET/items/*
+
+  # Reusable deployment capturing API configuration changes.
+  ItemsApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PostItemsMethod
+      - GetItemByIdMethod
+      - ItemsOptionsMethod
+      - ItemByIdOptionsMethod
+    Properties:
+      RestApiId: !Ref ItemsRestApi
+      Description: Deployment for Items API
+
+  # Stage tying deployment to a stage name and enabling CloudWatch metrics and
+  # request logging for observability.
+  ItemsApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ItemsRestApi
+      DeploymentId: !Ref ItemsApiDeployment
+      StageName: !Ref StageName
+      MethodSettings:
+        - HttpMethod: "*"
+          ResourcePath: "/*"
+          MetricsEnabled: true
+          LoggingLevel: INFO
+          DataTraceEnabled: false
+      TracingEnabled: true
+
+  # API key provisioned conditionally for scenarios requiring authenticated
+  # clients and usage tracking.
+  ItemsApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Condition: CreateApiKey
+    Properties:
+      Enabled: true
+      Name: !Sub ItemsApiKey-${StageName}
+      StageKeys:
+        - RestApiId: !Ref ItemsRestApi
+          StageName: !Ref StageName
+
+  # Usage plan to manage throttling and quota when API keys are enabled.
+  ItemsUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Condition: CreateApiKey
+    Properties:
+      UsagePlanName: !Sub ItemsUsagePlan-${StageName}
+      ApiStages:
+        - ApiId: !Ref ItemsRestApi
+          Stage: !Ref StageName
+      Throttle:
+        BurstLimit: 100
+        RateLimit: 50
+
+  # Usage plan key associates API key with the usage plan.
+  ItemsUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Condition: CreateApiKey
+    Properties:
+      KeyId: !Ref ItemsApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ItemsUsagePlan
+
+# ------------------------------------------------------------------------------
+# Outputs surface key deployment details back to stack consumers.
+# ------------------------------------------------------------------------------
+Outputs:
+  ApiBaseUrl:
+    Description: Invoke URL for the deployed API stage.
+    Value: !Sub https://${ItemsRestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiBaseUrl
+
+  ItemsTableName:
+    Description: Logical name of the DynamoDB table storing items.
+    Value: !Ref ItemsTable
+
+  CreateItemFunctionName:
+    Description: Name of the Lambda function backing POST /items.
+    Value: !Ref CreateItemFunction
+
+  GetItemFunctionName:
+    Description: Name of the Lambda function backing GET /items/{id}.
+    Value: !Ref GetItemFunction

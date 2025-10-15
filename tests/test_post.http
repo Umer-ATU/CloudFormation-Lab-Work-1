@@ -1,0 +1,9 @@
+### HTTPie / VSCode REST Client sample request for POST /items endpoint.
+POST {{invoke_url}}/items HTTP/1.1
+Content-Type: application/json
+X-Api-Key: {{api_key}}
+
+{
+  "name": "Sample Item",
+  "description": "Created via local HTTP test file."
+}
